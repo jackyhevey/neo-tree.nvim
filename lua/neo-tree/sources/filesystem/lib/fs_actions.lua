@@ -15,6 +15,73 @@ local Path = require("plenary.path")
 
 local M = {}
 
+---@type string?
+local _file_completion_root
+
+---@alias neotree.sources.filesystem.lib.fs_actions._filter (fun(abspath: string, nodetype: string):boolean)?
+local _file_completion_filter
+
+---@param arglead string
+---@param cmdline string
+---@param cursorpos integer
+---@return string[]
+M._file_completion = function(arglead, cmdline, cursorpos)
+  assert(_file_completion_root, "No file completion root specified for file compleiton")
+  local in_external_vim_ui_input = vim.bo[0].buftype == "prompt"
+  if in_external_vim_ui_input then
+    -- HACK: in snacks.input (and presumably other vim.ui.input windows that use getcompletion()),
+    -- cursor col/row seem to be stuck at (1,0). Assume we are at the end of the cmdline if so.
+    cursorpos = math.max(cursorpos, #cmdline)
+  end
+
+  local cmdline_before_cursor = cmdline:sub(1, cursorpos)
+
+  local input_root = _file_completion_root
+  if #input_root == 0 then
+    -- Path needs some sort of actual path, derive path from cmdline before cursor instead
+    local drive, root, tail = utils.path_splitroot(cmdline_before_cursor)
+    input_root = drive .. root
+    cmdline_before_cursor = tail
+  end
+
+  local globexpr = vim.endswith(cmdline_before_cursor, "*") and cmdline_before_cursor
+    or cmdline .. "*"
+
+  ---Escape for globpath
+  local escaped_root = input_root:gsub(",", "\\,")
+  ---@type string[]
+  local fullpath_matches = vim.fn.globpath(escaped_root, globexpr, true, true, true)
+
+  ---@type string[]
+  local formatted_results = {}
+  local drive, root, tail = utils.path_splitroot(input_root)
+  local root_is_anchor = #drive + #root > 0 and #tail == 0
+  -- if input root is /, we cutoff the root itself
+  -- If it's longer (like /home), cutoff the root + the next path separator
+  local result_cutoff = #input_root + (root_is_anchor and 1 or 2)
+  for _, fullpath in ipairs(fullpath_matches) do
+    local stat = uv.fs_stat(fullpath)
+    if not _file_completion_filter or _file_completion_filter(fullpath, stat) then
+      local result = fullpath:sub(result_cutoff)
+      if stat and stat.type == "directory" then
+        result = result .. utils.path_separator
+      end
+      formatted_results[#formatted_results + 1] = result
+    end
+  end
+
+  return formatted_results
+end
+
+---@param root string
+---@param filter neotree.sources.filesystem.lib.fs_actions._filter
+---@return string completefunc_str
+local setup_file_completion = function(root, filter)
+  _file_completion_root = root
+  _file_completion_filter = filter
+  return "customlist,v:lua.require'neo-tree.sources.filesystem.lib.fs_actions'._file_completion"
+end
+
 ---@param a uv.fs_stat.result?
 ---@param b uv.fs_stat.result?
 ---@return boolean equal Whether a and b are stats of the same file
@@ -153,76 +220,63 @@ local function rename_buffer(old_path, new_path)
 end
 
 local folder_perm = tonumber("755", 8)
-local function create_all_parents(path)
-  local function create_all_as_folders(in_path)
-    if not uv.fs_stat(in_path) then
-      local parent, _ = utils.split_path(in_path)
-      if parent then
-        create_all_as_folders(parent)
-      end
-      uv.fs_mkdir(in_path, folder_perm)
+local function create_parent_folders(in_path)
+  if not uv.fs_stat(in_path) then
+    local parent, _ = utils.split_path(in_path)
+    if parent then
+      create_parent_folders(parent)
     end
+    uv.fs_mkdir(in_path, folder_perm)
   end
+end
 
+local function create_all_parents(path)
   local parent_path, _ = utils.split_path(path)
-  create_all_as_folders(parent_path)
+  create_parent_folders(parent_path)
 end
 
 -- Gets a non-existing filename from the user and executes the callback with it.
 ---@param source string
 ---@param destination string
----@param using_root_directory string?
----@param name_chosen_callback fun(string)
+---@param input_root string
+---@param on_new_filename fun(string)
 ---@param first_message string?
-local function get_unused_name(
-  source,
-  destination,
-  using_root_directory,
-  name_chosen_callback,
-  first_message
-)
-  if not rename_is_safe(source, destination) then
-    local parent_path, name
-    if not using_root_directory then
-      parent_path, name = utils.split_path(destination)
-    elseif #using_root_directory > 0 then
-      parent_path = destination:sub(1, #using_root_directory)
-      name = destination:sub(#using_root_directory + 2)
-    else
-      parent_path = nil
-      name = destination
-    end
-
-    local message = first_message or name .. " already exists. Please enter a new name: "
-    inputs.input(message, name, function(new_name)
-      if new_name and string.len(new_name) > 0 then
-        local new_path = parent_path and parent_path .. utils.path_separator .. new_name or new_name
-        get_unused_name(source, new_path, using_root_directory, name_chosen_callback)
-      end
-    end)
-  else
-    name_chosen_callback(destination)
+local function get_unused_name(source, destination, input_root, on_new_filename, first_message)
+  if rename_is_safe(source, destination) then
+    on_new_filename(destination)
+    return
   end
+
+  local parent_path, name
+  if #input_root > 0 then
+    parent_path = destination:sub(1, #input_root)
+    name = destination:sub(#input_root + 2)
+  else
+    parent_path = nil
+    name = destination
+  end
+
+  local message = first_message or name .. " already exists. Please enter a new name: "
+  inputs.input(message, name, function(new_name)
+    if not new_name or #new_name == 0 then
+      return
+    end
+    local new_path = parent_path and parent_path .. utils.path_separator .. new_name or new_name
+    get_unused_name(source, new_path, input_root, on_new_filename)
+  end, {}, setup_file_completion(input_root))
 end
 
----Copy Node
+---Move node
 ---@generic S : string
 ---@generic D : string?
 ---@param source S
 ---@param destination D
 ---@param callback fun(source: S, destination: D|S)
----@param using_root_directory string?
-M.move_node = function(source, destination, callback, using_root_directory)
-  log.trace(
-    "Moving node:",
-    source,
-    "to",
-    destination,
-    ", using root directory:",
-    using_root_directory
-  )
+---@param input_root string
+M.move_node = function(source, destination, callback, input_root)
+  log.trace("Moving node:", source, "to", destination, ", using root directory:", input_root)
   local _, name = utils.split_path(source)
-  get_unused_name(source, destination or source, using_root_directory, function(dest)
+  get_unused_name(source, destination or source, input_root, function(dest)
     local parent_of_dest, _ = utils.split_path(dest)
     if source == parent_of_dest then
       log.warn("Cannot move " .. source .. " to itself")
@@ -305,10 +359,10 @@ end
 ---@param source S
 ---@param destination D
 ---@param callback fun(source: S, destination: D|S)
----@param using_root_directory string?
-M.copy_node = function(source, destination, callback, using_root_directory)
+---@param input_root string
+M.copy_node = function(source, destination, callback, input_root)
   local _, name = utils.split_path(source)
-  get_unused_name(source, destination or source, using_root_directory, function(dest)
+  get_unused_name(source, destination or source, input_root, function(dest)
     local parent_of_dest, _ = utils.split_path(dest)
     if source == parent_of_dest then
       log.warn("Cannot copy " .. source .. " to itself")
@@ -369,19 +423,21 @@ M.copy_node = function(source, destination, callback, using_root_directory)
 end
 
 --- Create a new directory
-M.create_directory = function(in_directory, callback, using_root_directory)
+---@param in_directory string
+---@param callback fun(destination: string)
+---@param input_root string
+M.create_directory = function(in_directory, callback, input_root)
   local base
-  if type(using_root_directory) == "string" then
-    if in_directory == using_root_directory then
+  if type(input_root) == "string" then
+    if in_directory == input_root then
       base = ""
-    elseif #using_root_directory > 0 then
-      base = in_directory:sub(#using_root_directory + 2) .. utils.path_separator
+    elseif #input_root > 0 then
+      base = in_directory:sub(#input_root + 2) .. utils.path_separator
     else
       base = in_directory .. utils.path_separator
     end
   else
     base = vim.fn.fnamemodify(in_directory .. utils.path_separator, ":~")
-    using_root_directory = false
   end
 
   inputs.input("Enter name for new directory:", base, function(destinations)
@@ -394,8 +450,8 @@ M.create_directory = function(in_directory, callback, using_root_directory)
         return
       end
 
-      if using_root_directory then
-        destination = utils.path_join(using_root_directory, destination)
+      if input_root then
+        destination = utils.path_join(input_root, destination)
       else
         destination = vim.fn.fnamemodify(destination, ":p")
       end
@@ -420,23 +476,25 @@ M.create_directory = function(in_directory, callback, using_root_directory)
         end
       end)
     end
-  end)
+  end, {}, setup_file_completion(input_root))
 end
 
 --- Create Node
-M.create_node = function(in_directory, callback, using_root_directory)
+---@param in_directory string the directory to default to
+---@param callback fun(destination: string)
+---@param input_root string the root of the input
+M.create_node = function(in_directory, callback, input_root)
   local base
-  if type(using_root_directory) == "string" then
-    if in_directory == using_root_directory then
+  if type(input_root) == "string" then
+    if in_directory == input_root then
       base = ""
-    elseif #using_root_directory > 0 then
-      base = in_directory:sub(#using_root_directory + 2) .. utils.path_separator
+    elseif #input_root > 0 then
+      base = in_directory:sub(#input_root + 2) .. utils.path_separator
     else
       base = in_directory .. utils.path_separator
     end
   else
     base = vim.fn.fnamemodify(in_directory .. utils.path_separator, ":~")
-    using_root_directory = false
   end
 
   local dir_ending = '"/"'
@@ -456,8 +514,8 @@ M.create_node = function(in_directory, callback, using_root_directory)
       local is_dir = vim.endswith(destination, "/")
         or vim.endswith(destination, utils.path_separator)
 
-      if using_root_directory then
-        destination = utils.path_join(using_root_directory, destination)
+      if input_root then
+        destination = utils.path_join(input_root, destination)
       else
         destination = vim.fn.fnamemodify(destination, ":p")
       end
@@ -499,7 +557,7 @@ M.create_node = function(in_directory, callback, using_root_directory)
       end
       complete()
     end
-  end)
+  end, {}, setup_file_completion(input_root))
 end
 
 ---Recursively delete a directory and its children.
@@ -669,35 +727,42 @@ M.delete_nodes = function(paths_to_delete, callback)
   end)
 end
 
-local rename_node = function(msg, name, get_destination, path, callback)
-  inputs.input(msg, name, function(new_name)
+---@alias neotree.sources.filesystem.ActionCallbacks.OnRename fun(source: string, destination: string)
+
+---@param prompt string
+---@param default_name string?
+---@param resolve_destination fun(input: string):string
+---@param source string
+---@param on_rename neotree.sources.filesystem.ActionCallbacks.OnRename?
+local rename_node = function(prompt, default_name, resolve_destination, source, on_rename)
+  inputs.input(prompt, default_name, function(new_name)
     -- If cancelled
     if not new_name or new_name == "" then
       log.info("Operation canceled")
       return
     end
 
-    local destination = get_destination(new_name)
+    local destination = resolve_destination(new_name)
 
-    if not rename_is_safe(path, destination) then
+    if not rename_is_safe(source, destination) then
       log.warn(destination, " already exists, canceling")
       return
     end
 
     local complete = vim.schedule_wrap(function()
-      rename_buffer(path, destination)
+      rename_buffer(source, destination)
       events.fire_event(events.FILE_RENAMED, {
-        source = path,
+        source = source,
         destination = destination,
       })
-      if callback then
-        callback(path, destination)
+      if on_rename then
+        on_rename(source, destination)
       end
       log.info("Renamed " .. new_name .. " successfully")
     end)
 
     local function fs_rename()
-      uv.fs_rename(path, destination, function(err)
+      uv.fs_rename(source, destination, function(err)
         if err then
           log.warn("Could not rename the files")
           return
@@ -707,7 +772,7 @@ local rename_node = function(msg, name, get_destination, path, callback)
     end
 
     local event_result = events.fire_event(events.BEFORE_FILE_RENAME, {
-      source = path,
+      source = source,
       destination = destination,
       callback = fs_rename,
     }) or {}
@@ -716,37 +781,41 @@ local rename_node = function(msg, name, get_destination, path, callback)
       return
     end
     fs_rename()
-  end)
+  end, {}, setup_file_completion(source))
 end
 
 -- Rename Node
-M.rename_node = function(path, callback)
+---@param path string
+---@param on_rename neotree.sources.filesystem.ActionCallbacks.OnRename?
+M.rename_node = function(path, on_rename)
   local parent_path, name = utils.split_path(path)
-  local msg = string.format('Enter new name for "%s":', name)
+  local prompt = string.format('Enter new name for "%s":', name)
 
-  local get_destination = function(new_name)
+  local resolve_destination = function(new_name)
     return parent_path .. utils.path_separator .. new_name
   end
 
-  rename_node(msg, name, get_destination, path, callback)
+  rename_node(prompt, name, resolve_destination, path, on_rename)
 end
 
 -- Rename Node Base Name
-M.rename_node_basename = function(path, callback)
-  local parent_path, name = utils.split_path(path)
-  local base_name = vim.fn.fnamemodify(path, ":t:r")
-  local extension = vim.fn.fnamemodify(path, ":e")
+---@param source string
+---@param on_rename neotree.sources.filesystem.ActionCallbacks.OnRename?
+M.rename_node_basename = function(source, on_rename)
+  local parent_path, name = utils.split_path(source)
+  local base_name = vim.fn.fnamemodify(source, ":t:r")
+  local extension = vim.fn.fnamemodify(source, ":e")
 
-  local msg = string.format('Enter new base name for "%s":', name)
+  local prompt = string.format('Enter new base name for "%s":', name)
 
-  local get_destination = function(new_base_name)
+  local resolve_destination = function(new_base_name)
     return parent_path
       .. utils.path_separator
       .. new_base_name
       .. (extension:len() == 0 and "" or "." .. extension)
   end
 
-  rename_node(msg, base_name, get_destination, path, callback)
+  rename_node(prompt, base_name, resolve_destination, source, on_rename)
 end
 
 return M
